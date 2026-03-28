@@ -1,36 +1,175 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Zeerostock Inventory Database
 
-## Getting Started
+A backend API for managing supplier inventory — built with Next.js, TypeScript, PostgreSQL, and Prisma.
 
-First, run the development server:
+## Setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Add your database URL to `.env`:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```env
+DATABASE_URL="postgresql://user:password@localhost:5432/zeerostock"
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npx prisma migrate dev --name init
+npm run dev
+```
 
-## Learn More
+## Database Schema
 
-To learn more about Next.js, take a look at the following resources:
+Two tables with a one-to-many relationship:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+**Supplier**
+| Column | Type | Notes |
+|---|---|---|
+| id | Int | Primary key, auto-increment |
+| name | String | Supplier name |
+| city | String | City of operation |
+| createdAt | DateTime | Auto-set on create |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+**Inventory**
+| Column | Type | Notes |
+|---|---|---|
+| id | Int | Primary key, auto-increment |
+| supplier_id | Int | Foreign key → Supplier.id |
+| product_name | String | Name of the product |
+| quantity | Int | Must be ≥ 0 |
+| price | Decimal(10,2) | Must be > 0 |
+| createdAt | DateTime | Auto-set on create |
 
-## Deploy on Vercel
+One supplier can have many inventory items. Deleting a supplier without removing their inventory is blocked at the database level via the foreign key constraint.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+`price` is stored as `Decimal` not `Float` to avoid floating point rounding errors in financial data.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## API Reference
+
+### `POST /api/supplier`
+
+Create a new supplier.
+
+**Request body:**
+
+```json
+{ "name": "Sharma Textiles", "city": "Surat" }
+```
+
+**Response `201`:**
+
+```json
+{ "id": 1, "name": "Sharma Textiles", "city": "Surat" }
+```
+
+---
+
+### `POST /api/inventory`
+
+Add an inventory item. Supplier must exist.
+
+**Request body:**
+
+```json
+{
+  "supplier_id": 1,
+  "product_name": "Cotton Fabric Rolls",
+  "quantity": 200,
+  "price": 850
+}
+```
+
+**Response `201`:**
+
+```json
+{
+  "id": 1,
+  "supplier_id": 1,
+  "product_name": "Cotton Fabric Rolls",
+  "quantity": 200,
+  "price": 850
+}
+```
+
+**Errors:**
+
+- `400` — validation failed (quantity < 0, price ≤ 0, missing fields)
+- `404` — supplier not found
+
+---
+
+### `GET /api/inventory`
+
+Returns all inventory grouped by supplier, sorted by total inventory value (quantity × price) descending.
+
+**Response `200`:**
+
+```json
+[
+  {
+    "id": 1,
+    "name": "Sharma Textiles",
+    "city": "Surat",
+    "total_value": 230000,
+    "inventory": [
+      {
+        "id": 1,
+        "product_name": "Cotton Fabric Rolls",
+        "quantity": 200,
+        "price": 850,
+        "item_value": 170000
+      }
+    ]
+  }
+]
+```
+
+## Testing
+
+All APIs tested via Postman.
+
+**Suppliers created:**
+
+```json
+{ "name": "Sharma Textiles",     "city": "Surat"  }
+{ "name": "PackRight Industries", "city": "Pune"   }
+{ "name": "BoltMaster Hardware",  "city": "Nashik" }
+```
+
+**Inventory added:**
+
+```json
+{ "supplier_id": 1, "product_name": "Cotton Fabric Rolls",     "quantity": 200,  "price": 850 }
+{ "supplier_id": 1, "product_name": "Polyester Thread Spools", "quantity": 500,  "price": 120 }
+{ "supplier_id": 2, "product_name": "Corrugated Boxes 12x10x8","quantity": 5000, "price": 45  }
+{ "supplier_id": 2, "product_name": "Bubble Wrap Rolls",        "quantity": 300,  "price": 200 }
+{ "supplier_id": 3, "product_name": "Hex Bolts M10",            "quantity": 10000,"price": 12  }
+{ "supplier_id": 3, "product_name": "Steel Washers",            "quantity": 8000, "price": 5   }
+```
+
+**Edge cases verified:**
+| Test | Expected | Result |
+|---|---|---|
+| `supplier_id: 999` (non-existent) | `404 Supplier not found` | ✅ |
+| `quantity: -5` | `400` validation error | ✅ |
+| `price: 0` | `400` validation error | ✅ |
+
+## Why SQL over NoSQL
+
+We chose SQL because our data is relational. Inventory items belong to suppliers, and PostgreSQL ensures this relationship with foreign key constraints. This means you can’t add an inventory item for a supplier that doesn’t exist.
+
+With NoSQL like MongoDB, you would have to check this manually in code. For structured and consistent data like ours, SQL is the better choice.
+
+## Indexing Optimization
+
+An index is added on `inventory.supplier_id`:
+
+```prisma
+@@index([supplier_id])
+```
+
+The `GET /inventory` query joins the `suppliers` and `inventory` tables using a specific column (e.g., `supplier_id`).
+
+- **Without the index**: PostgreSQL must scan every row in the `inventory` table to find matches. This is slow for large tables.
+- **With the index**: PostgreSQL can directly jump to the relevant rows, making the query much faster, especially when there are thousands of inventory items.
